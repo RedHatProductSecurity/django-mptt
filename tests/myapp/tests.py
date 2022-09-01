@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.db.models.query_utils import DeferredAttribute
 from django.template import Context, Template, TemplateSyntaxError
 from django.test import RequestFactory, TestCase, override_settings
+from django.utils.encoding import smart_str
 from model_bakery import baker
 from model_mommy import mommy
 
@@ -46,6 +47,8 @@ from myapp.models import (
     Student,
     SubItem,
     UniqueTogetherModel,
+    UnorderedCategory,
+    UnorderedGenre,
     UUIDNode,
 )
 
@@ -54,7 +57,7 @@ from mptt.managers import TreeManager
 from mptt.models import MPTTModel
 from mptt.signals import node_moved
 from mptt.templatetags.mptt_tags import cache_tree_children
-from mptt.utils import print_debug_info
+from mptt.utils import clean_tree_ids, print_debug_info
 
 
 def get_tree_details(nodes):
@@ -96,15 +99,179 @@ def tree_details(text):
     return leading_whitespace_re.sub("", text.rstrip())
 
 
+class ComparableTreeNode(object):
+    """
+    This class wraps MPTTModel tree node comparison logic into a nice reusable pattern.  Tree comparision is handled by
+    the ComparableTree class, which uses this class for node comparison.
+    """
+
+    def __init__(self, **fields):
+        super(ComparableTreeNode, self).__init__()
+        self.pk = smart_str(fields.get("pk", None))
+        self.parent_id = smart_str(fields.get("parent_id", None))
+        self.tree_id = smart_str(fields.get("tree_id", None))
+        self.level = smart_str(fields.get("level", None))
+        self.left = smart_str(fields.get("left", None))
+        self.right = smart_str(fields.get("right", None))
+
+    @staticmethod
+    def get_tree_id(node, opts=None):
+        if opts is None:
+            opts = node._mptt_meta
+        tree_id = smart_str(getattr(node, opts.tree_id_attr))
+        # only take the first 8 characters of a uuid
+        if not opts.root_node_ordering:
+            return tree_id[:8]
+        else:
+            return tree_id
+
+    def __hash__(self):
+        return hash(self.pk)
+
+    def __eq__(self, o):
+        # if we don't have a TreeNode raise a ValueError
+        if not isinstance(o, ComparableTreeNode):
+            raise ValueError("Cannot compare TreeNode to {}".format(o))
+        # loop over all the fields that SHOULD be equal and fail if we see a discrepancy
+        for field in ["pk", "parent_id", "level", "left", "right"]:
+            if getattr(self, field) != getattr(o, field):
+                return False
+        # check the tree_id in a special way, because we allow fuzzy comparison here, fail if discrepancy
+        if self.tree_id != "*" and o.tree_id != "*" and self.tree_id != o.tree_id:
+            return False
+        # otherwise they are equal
+        return True
+
+    def __str__(self):
+        return "{} {} {} {} {} {}".format(
+            self.pk.rjust(3),
+            self.parent_id.rjust(3),
+            self.tree_id.rjust(9),
+            self.level.rjust(3),
+            self.left.rjust(3),
+            self.right.rjust(3),
+        )
+
+
+class ComparableTree(object):
+    """
+    This class wraps MPTTModel tree comparison logic into a nice reusable pattern.  Node comparision is handled by the
+    ComparableTreeNode class, while tree comparison is handled by this class.
+    """
+
+    def __init__(self, nodes):
+        super(ComparableTree, self).__init__()
+        nodes = list(nodes)
+        self.nodes = dict()
+        for node in nodes:
+            if isinstance(node, MPTTModel):
+                options = node._mptt_meta
+                # we have a list of models
+                fields = dict(
+                    pk=node.pk,
+                    parent_id=getattr(node, "%s_id" % options.parent_attr) or "-",
+                    tree_id=ComparableTreeNode.get_tree_id(node),
+                    level=getattr(node, options.level_attr, "level"),
+                    left=getattr(node, options.left_attr, "left"),
+                    right=getattr(node, options.right_attr, "right"),
+                )
+                node = ComparableTreeNode(**fields)
+                self.nodes[node.pk] = node
+            elif isinstance(node, ComparableTreeNode):
+                self.nodes[node.pk] = node
+
+    @property
+    def node_set(self):
+        return set(self.nodes.values())
+
+    @staticmethod
+    def build_comparable_tree(nodes):
+        """
+        Creates pertinent tree details for the given list of nodes.
+        The fields are:
+            id  parent_id  tree_id  level  left  right
+        """
+        if hasattr(nodes, "order_by"):
+            nodes = list(nodes.order_by("tree_id", "lft", "pk"))
+        elif isinstance(nodes, str):
+            tree_nodes = []
+            for node in [i.strip() for i in nodes.split("\n") if i.strip()]:
+                params = {}
+                # split the node into its components (broken apart by spaces with empty strings removed)
+                # ex:  components = ['1', '-', 'ab3d48ff', '0', '1', '2']
+                components = [i for i in node.split(" ") if i]
+
+                # a simple function that returns the first element of the list and the rest of the list as a tuple
+                def pop_head(lis):
+                    return lis[0], lis[1:]
+
+                # loop over the parameters in the component array, note that order is very important
+                for key in ["pk", "parent_id", "tree_id", "level", "left", "right"]:
+                    params[key], components = pop_head(components)
+                tree_nodes.append(ComparableTreeNode(**params))
+            return ComparableTree(tree_nodes)
+        # just in case we were handed a singular object as nodes, noop if nodes is already a list
+        nodes = list(nodes)
+        return ComparableTree(nodes)
+
+    @staticmethod
+    def _display_nodes(nodes):
+        return "\n" + "\n".join([str(n) for n in nodes]) + "\n"
+
+    def diff(self, o):
+        changed_ids = {i.pk for i in self.node_set.symmetric_difference(o.node_set)}
+        changes_display = []
+
+        def sp(a):
+            return " " * a
+
+        def ln(a):
+            return "-" * a
+
+        HEADERS = " id   p  tree_id   lvl  l   r"
+        NOT_PRESENT = smart_str("{0} Not present {0}".format(ln(8)))
+
+        changes_display.append(sp(24) + "FOUND" + sp(4) + "-->" + sp(3) + " EXPECTED\n")
+        changes_display.append(ln(70) + "\n")
+        changes_display.append(
+            "{headers}{spacing}{headers}\n".format(spacing=sp(9), headers=HEADERS)
+        )
+        changes_display.append(ln(70) + "\n")
+
+        for id in changed_ids:
+            changes_display.append(
+                smart_str(self.nodes[id]) if id in self.nodes else NOT_PRESENT
+            )
+            changes_display.append("    -->  ")
+            changes_display.append(
+                smart_str(o.nodes[id]) if id in o.nodes else NOT_PRESENT
+            )
+            changes_display.append("\n")
+
+        return "Some nodes are not equivalent...\n{}".format("".join(changes_display))
+
+    def __and__(self, o):
+        return self.node_set & o.node_set
+
+    def __or__(self, o):
+        return self.node_set & o.node_set
+
+    def __sub__(self, o):
+        return self.node_set - o.node_set
+
+    def __str__(self):
+        return self._display_nodes(self.node_set)
+
+    def __eq__(self, o):
+        # if there is no difference between the node sets, they are equivalent trees
+        return not self.node_set.symmetric_difference(o.node_set)
+
+
 class TreeTestCase(TestCase):
     def assertTreeEqual(self, tree1, tree2):
-        if not isinstance(tree1, str):
-            tree1 = get_tree_details(tree1)
-        tree1 = tree_details(tree1)
-        if not isinstance(tree2, str):
-            tree2 = get_tree_details(tree2)
-        tree2 = tree_details(tree2)
-        return self.assertEqual(tree1, tree2, "\n%r\n != \n%r" % (tree1, tree2))
+        tree1 = ComparableTree.build_comparable_tree(tree1)
+        tree2 = ComparableTree.build_comparable_tree(tree2)
+        self.assertEqual(tree1, tree2, tree1.diff(tree2))
 
 
 class DocTestTestCase(TreeTestCase):
@@ -140,17 +307,31 @@ class DocTestTestCase(TreeTestCase):
 
 # genres.json defines the following tree structure
 #
-# 1 - 1 0 1 16   action
-# 2 1 1 1 2 9    +-- platformer
-# 3 2 1 2 3 4    |   |-- platformer_2d
-# 4 2 1 2 5 6    |   |-- platformer_3d
-# 5 2 1 2 7 8    |   +-- platformer_4d
-# 6 1 1 1 10 15  +-- shmup
-# 7 6 1 2 11 12      |-- shmup_vertical
-# 8 6 1 2 13 14      +-- shmup_horizontal
-# 9 - 2 0 1 6    rpg
-# 10 9 2 1 2 3   |-- arpg
-# 11 9 2 1 4 5   +-- trpg
+#  1  -  1  0  1 16   action
+#  2  1  1  1  2  9    ├── platformer
+#  3  2  1  2  3  4    │   ├── platformer_2d
+#  4  2  1  2  5  6    │   ├── platformer_3d
+#  5  2  1  2  7  8    │   └── platformer_4d
+#  6  1  1  1 10 15    └── shmup
+#  7  6  1  2 11 12        ├── shmup_vertical
+#  8  6  1  2 13 14        └── shmup_horizontal
+#  9  -  2  0  1  6    rpg
+# 10  9  2  1  2  3    ├── arpg
+# 11  9  2  1  4  5    └── trpg
+
+# unordered_genres.json defines the following tree structure
+#
+#  1  - 11111111  0  1 16    action
+#  2  1 11111111  1  2  9    ├── platformer
+#  3  2 11111111  2  3  4    │   ├── platformer_2d
+#  4  2 11111111  2  5  6    │   ├── platformer_3d
+#  5  2 11111111  2  7  8    │   └── platformer_4d
+#  6  1 11111111  1 10 15    └── shmup
+#  7  6 11111111  2 11 12        ├── shmup_vertical
+#  8  6 11111111  2 13 14        └── shmup_horizontal
+#  9  - 22222222  0  1  6    rpg
+# 10  9 22222222  1  2  3    ├── arpg
+# 11  9 22222222  1  4  5    └── trpg
 
 
 class ReparentingTestCase(TreeTestCase):
@@ -161,7 +342,7 @@ class ReparentingTestCase(TreeTestCase):
     should they be required for use after a save.
     """
 
-    fixtures = ["genres.json"]
+    fixtures = ["genres.json", "unordered_genres.json"]
 
     def test_new_root_from_subtree(self):
         shmup = Genre.objects.get(id=6)
@@ -185,6 +366,31 @@ class ReparentingTestCase(TreeTestCase):
         """,
         )
 
+    def test_new_unordered_root_from_subtree(self):
+        shmup = UnorderedGenre.objects.get(id=6)
+        shmup.parent = None
+        shmup.save()
+        tree_id = smart_str(shmup.tree_id)[:8]
+        self.assertTreeEqual([shmup], "6 - {} 0 1 6".format(tree_id))
+        self.assertTreeEqual(
+            UnorderedGenre.objects.all(),
+            """
+             1  -  11111111  0  1 10
+             2  1  11111111  1  2  9
+             3  2  11111111  2  3  4
+             4  2  11111111  2  5  6
+             5  2  11111111  2  7  8
+             9  -  22222222  0  1  6
+            10  9  22222222  1  2  3
+            11  9  22222222  1  4  5
+             6  -  {tree_id} 0  1  6
+             7  6  {tree_id} 1  2  3
+             8  6  {tree_id} 1  4  5
+        """.format(
+                tree_id=tree_id
+            ),
+        )
+
     def test_new_root_from_leaf_with_siblings(self):
         platformer_2d = Genre.objects.get(id=3)
         platformer_2d.parent = None
@@ -205,6 +411,31 @@ class ReparentingTestCase(TreeTestCase):
             11 9 2 1 4 5
             3 - 3 0 1 2
         """,
+        )
+
+    def test_new_unordered_root_from_leaf_with_siblings(self):
+        platformer_2d = UnorderedGenre.objects.get(id=3)
+        platformer_2d.parent = None
+        platformer_2d.save()
+        tree_id = smart_str(platformer_2d.tree_id)[:8]
+        self.assertTreeEqual([platformer_2d], "3 - {} 0 1 2".format(tree_id))
+        self.assertTreeEqual(
+            UnorderedGenre.objects.all(),
+            """
+            1  -  11111111  0  1 14
+            2  1  11111111  1  2  7
+            4  2  11111111  2  3  4
+            5  2  11111111  2  5  6
+            6  1  11111111  1  8 13
+            7  6  11111111  2  9 10
+            8  6  11111111  2 11 12
+            9  -  22222222  0  1  6
+           10  9  22222222  1  2  3
+           11  9  22222222  1  4  5
+            3  -  {tree_id} 0  1  2
+        """.format(
+                tree_id=tree_id
+            ),
         )
 
     def test_new_child_from_root(self):
@@ -328,23 +559,35 @@ class ReparentingTestCase(TreeTestCase):
         )
 
     def test_move_to(self):
-        rpg = Genre.objects.get(pk=9)
-        action = Genre.objects.get(pk=1)
+        self.__move_to(Genre)
+
+    def test_unordered_move_to(self):
+        self.__move_to(UnorderedGenre)
+
+    def __move_to(self, cls):
+        rpg = cls.objects.get(pk=9)
+        action = cls.objects.get(pk=1)
         rpg.move_to(action)
         rpg.save()
         self.assertEqual(rpg.parent, action)
 
     def test_invalid_moves(self):
+        self.__invalid_moves(Genre)
+
+    def test_invalid_unordered_moves(self):
+        self.__invalid_moves(UnorderedGenre)
+
+    def __invalid_moves(self, cls):
         # A node may not be made a child of itself
-        action = Genre.objects.get(id=1)
+        action = cls.objects.get(id=1)
         action.parent = action
-        platformer = Genre.objects.get(id=2)
+        platformer = cls.objects.get(id=2)
         platformer.parent = platformer
         self.assertRaises(InvalidMove, action.save)
         self.assertRaises(InvalidMove, platformer.save)
 
         # A node may not be made a child of any of its descendants
-        platformer_4d = Genre.objects.get(id=5)
+        platformer_4d = cls.objects.get(id=5)
         action.parent = platformer_4d
         platformer.parent = platformer_4d
         self.assertRaises(InvalidMove, action.save)
@@ -457,16 +700,29 @@ class ConcurrencyTestCase(TreeTestCase):
 
 # categories.json defines the following tree structure:
 #
-# 1 - 1 0 1 20    games
-# 2 1 1 1 2 7     +-- wii
-# 3 2 1 2 3 4     |   |-- wii_games
-# 4 2 1 2 5 6     |   +-- wii_hardware
-# 5 1 1 1 8 13    +-- xbox360
-# 6 5 1 2 9 10    |   |-- xbox360_games
-# 7 5 1 2 11 12   |   +-- xbox360_hardware
-# 8 1 1 1 14 19   +-- ps3
-# 9 8 1 2 15 16       |-- ps3_games
-# 10 8 1 2 17 18      +-- ps3_hardware
+#  1  -  1  0  1 20     games
+#  2  1  1  1  2  7     ├── wii
+#  3  2  1  2  3  4     │   ├── wii_games
+#  4  2  1  2  5  6     │   └── wii_hardware
+#  5  1  1  1  8 13     ├── xbox360
+#  6  5  1  2  9 10     │   ├── xbox360_games
+#  7  5  1  2 11 12     │   └── xbox360_hardware
+#  8  1  1  1 14 19     └── ps3
+#  9  8  1  2 15 16         ├── ps3_games
+# 10  8  1  2 17 18         └── ps3_hardware
+
+# unordered_categories.json defines the following tree structure:
+#
+#  1  - 11111111  0  1 20    games
+#  2  1 11111111  1  2  7     ├── wii
+#  3  2 11111111  2  3  4     │   ├── wii_games
+#  4  2 11111111  2  5  6     │   └── wii_hardware
+#  5  1 11111111  1  8 13     ├── xbox360
+#  6  5 11111111  2  9 10     │   ├── xbox360_games
+#  7  5 11111111  2 11 12     │   └── xbox360_hardware
+#  8  1 11111111  1 14 19     └── ps3
+#  9  8 11111111  2 15 16         ├── ps3_games
+# 10  8 11111111  2 17 18         └── ps3_hardware
 
 
 class DeletionTestCase(TreeTestCase):
@@ -476,7 +732,7 @@ class DeletionTestCase(TreeTestCase):
     deletion scenarios.
     """
 
-    fixtures = ["categories.json"]
+    fixtures = ["categories.json", "unordered_categories.json"]
 
     def test_delete_root_node(self):
         # Add a few other roots to verify that they aren't affected
@@ -513,6 +769,52 @@ class DeletionTestCase(TreeTestCase):
         """,
         )
 
+    def test_delete_root_node_unordered(self):
+        first = "Preceding root"
+        second = "Following root"
+
+        # Add a few other roots to verify that they aren't affected
+        UnorderedCategory(name=first).insert_at(
+            UnorderedCategory.objects.get(id=1), "left", save=True
+        )
+        UnorderedCategory(name=second).insert_at(
+            UnorderedCategory.objects.get(id=1), "right", save=True
+        )
+
+        tree_1 = smart_str(UnorderedCategory.objects.get(name=first).tree_id)[:8]
+        tree_2 = smart_str(UnorderedCategory.objects.get(name=second).tree_id)[:8]
+
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+            11  -  {tree_1}  0  1  2
+             1  -  11111111  0  1 20
+             2  1  11111111  1  2  7
+             3  2  11111111  2  3  4
+             4  2  11111111  2  5  6
+             5  1  11111111  1  8 13
+             6  5  11111111  2  9 10
+             7  5  11111111  2 11 12
+             8  1  11111111  1 14 19
+             9  8  11111111  2 15 16
+            10  8  11111111  2 17 18
+            12  -  {tree_2}  0  1  2
+        """.format(
+                tree_1=tree_1, tree_2=tree_2
+            ),
+        )
+
+        UnorderedCategory.objects.get(id=1).delete()
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+            11  -  {tree_1}  0  1  2
+            12  -  {tree_2}  0  1  2
+        """.format(
+                tree_1=tree_1, tree_2=tree_2
+            ),
+        )
+
     def test_delete_last_node_with_siblings(self):
         Category.objects.get(id=9).delete()
         self.assertTreeEqual(
@@ -530,6 +832,23 @@ class DeletionTestCase(TreeTestCase):
         """,
         )
 
+    def test_delete_last_node_with_siblings_unordered(self):
+        UnorderedCategory.objects.get(id=9).delete()
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+             1  -  11111111  0  1 18
+             2  1  11111111  1  2  7
+             3  2  11111111  2  3  4
+             4  2  11111111  2  5  6
+             5  1  11111111  1  8 13
+             6  5  11111111  2  9 10
+             7  5  11111111  2 11 12
+             8  1  11111111  1 14 17
+            10  8  11111111  2 15 16
+        """,
+        )
+
     def test_delete_last_node_with_descendants(self):
         Category.objects.get(id=8).delete()
         self.assertTreeEqual(
@@ -542,6 +861,21 @@ class DeletionTestCase(TreeTestCase):
             5 1 1 1 8 13
             6 5 1 2 9 10
             7 5 1 2 11 12
+        """,
+        )
+
+    def test_delete_last_node_with_descendants_unordered(self):
+        UnorderedCategory.objects.get(id=8).delete()
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+            1  -  11111111  0  1 14
+            2  1  11111111  1  2  7
+            3  2  11111111  2  3  4
+            4  2  11111111  2  5  6
+            5  1  11111111  1  8 13
+            6  5  11111111  2  9 10
+            7  5  11111111  2 11 12
         """,
         )
 
@@ -566,6 +900,29 @@ class DeletionTestCase(TreeTestCase):
         )
         self.assertEqual(parent.get_descendant_count(), 1)
         parent = Category.objects.get(pk=parent.pk)
+        self.assertEqual(parent.get_descendant_count(), 1)
+
+    def test_delete_node_with_siblings_unordered(self):
+        child = UnorderedCategory.objects.get(id=6)
+        parent = child.parent
+        self.assertEqual(parent.get_descendant_count(), 2)
+        child.delete()
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+             1  -  11111111  0  1 18
+             2  1  11111111  1  2  7
+             3  2  11111111  2  3  4
+             4  2  11111111  2  5  6
+             5  1  11111111  1  8 11
+             7  5  11111111  2  9 10
+             8  1  11111111  1 12 17
+             9  8  11111111  2 13 14
+            10  8  11111111  2 15 16
+        """,
+        )
+        self.assertEqual(parent.get_descendant_count(), 1)
+        parent = UnorderedCategory.objects.get(pk=parent.pk)
         self.assertEqual(parent.get_descendant_count(), 1)
 
     def test_delete_node_with_descendants_and_siblings(self):
@@ -606,6 +963,27 @@ class DeletionTestCase(TreeTestCase):
             8 1 1 1 10 15
             9 8 1 2 11 12
             10 8 1 2 13 14""",
+        )
+
+    def test_delete_node_with_descendants_and_siblings_unordered(self):
+        """
+        Regression test for Issue 23 - we used to use pre_delete, which
+        resulted in tree cleanup being performed for every node being
+        deleted, rather than just the node on which ``delete()`` was
+        called.
+        """
+        UnorderedCategory.objects.get(id=5).delete()
+        self.assertTreeEqual(
+            UnorderedCategory.objects.all(),
+            """
+             1  -  11111111  0  1 14
+             2  1  11111111  1  2  7
+             3  2  11111111  2  3  4
+             4  2  11111111  2  5  6
+             8  1  11111111  1  8 13
+             9  8  11111111  2  9 10
+            10  8  11111111  2 11 12
+        """,
         )
 
 
@@ -3119,3 +3497,51 @@ class BakeryTest(TestCase):
             book = mommy.make("Book")
             self.assertQuerysetEqual(book.get_ancestors(), [])
             self.assertQuerysetEqual(book.get_descendants(), [])
+
+
+class TestUtils(TestCase):
+    def test_clean_tree_ids(self):
+        import uuid
+
+        uuid1 = uuid.uuid4()
+        uuid2 = uuid.uuid4()
+        uuid3 = uuid.uuid4()
+
+        def helper(s):
+            return smart_str(s).replace("-", "")
+
+        self.assertEqual(clean_tree_ids(uuid1, vendor="postgresql"), uuid1)
+        self.assertEqual(clean_tree_ids(uuid1, vendor="mysql"), helper(uuid1))
+        self.assertEqual(
+            clean_tree_ids(uuid1, vendor="some_weird_vendor"), helper(uuid1)
+        )
+
+        self.assertEqual(
+            clean_tree_ids(uuid1, uuid2, uuid3, vendor="postgresql"),
+            (uuid1, uuid2, uuid3),
+        )
+        self.assertEqual(
+            clean_tree_ids(uuid1, uuid2, uuid3, vendor="mysql"),
+            (helper(uuid1), helper(uuid2), helper(uuid3)),
+        )
+        self.assertEqual(
+            clean_tree_ids(uuid1, uuid2, uuid3, vendor="some_weird_vendor"),
+            (helper(uuid1), helper(uuid2), helper(uuid3)),
+        )
+
+        self.assertEqual(clean_tree_ids(1, root_ordering=True, vendor="postgresql"), 1)
+        self.assertEqual(clean_tree_ids(2, root_ordering=True, vendor="mysql"), 2)
+        self.assertEqual(
+            clean_tree_ids(3, root_ordering=True, vendor="some_weird_vendor"), 3
+        )
+
+        self.assertEqual(
+            clean_tree_ids(1, 2, 3, root_ordering=True, vendor="postgresql"), (1, 2, 3)
+        )
+        self.assertEqual(
+            clean_tree_ids(1, 2, 3, root_ordering=True, vendor="mysql"), (1, 2, 3)
+        )
+        self.assertEqual(
+            clean_tree_ids(1, 2, 3, root_ordering=True, vendor="some_weird_vendor"),
+            (1, 2, 3),
+        )
